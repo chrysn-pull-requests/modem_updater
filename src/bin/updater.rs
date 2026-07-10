@@ -53,16 +53,21 @@ use probe_rs::{
         sequences::DefaultArmSequence,
         ArmDebugInterface, FullyQualifiedApAddress,
     },
-    probe::{list::Lister, DebugProbeSelector, Probe},
+    probe::{list::Lister, DebugProbeInfo, DebugProbeSelector, Probe},
     Error, Permissions, Session,
 };
 
 fn print_usage() {
     println!("Modem Updater Usage:");
-    println!("  updater <operation> <firmware_path>");
+    println!("  updater [options] <operation> <firmware_path>");
     println!("\nOperations:");
     println!("  verify   - Verify firmware at the specified path");
     println!("  program  - Program and verify firmware at the specified path");
+    println!("\nOptions:");
+    println!("  --vid <id>       - USB vendor ID of the debug probe (e.g. 0x2e8a)");
+    println!("  --pid <id>       - USB product ID of the debug probe (e.g. 0x000c)");
+    println!("  --serial <str>   - Serial number of the debug probe");
+    println!("\nWithout options, exactly one debug probe must be connected.");
     println!("\nExample:");
     println!("  updater program _bin/mfw_nrf91x1_2.0.2.zip");
 }
@@ -70,10 +75,11 @@ fn print_usage() {
 struct Args {
     operation: String,
     path: String,
+    vid: Option<u16>,
+    pid: Option<u16>,
+    serial: Option<String>,
 }
 
-const PROBE_VENDOR_ID: u16 = 0x2e8a;
-const PROBE_PRODUCT_ID: u16 = 0x000c;
 const APP_MEM: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(0);
 const CTRL_AP: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(4);
 const FICR_INFO_PART: u64 = 0x00FF0140;
@@ -87,8 +93,42 @@ const C_HALT: u32 = 0x2;
 const C_DEBUGEN: u32 = 0x1;
 const DBGKEY: u32 = 0xA05F_0000;
 
+fn parse_u16(s: &str) -> Result<u16, String> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).map_err(|e| format!("invalid hex value '{s}': {e}"))
+    } else {
+        s.parse::<u16>()
+            .map_err(|e| format!("invalid value '{s}': {e}"))
+    }
+}
+
 fn parse_args() -> Result<Args, String> {
-    let mut positional: Vec<_> = std::env::args().skip(1).collect();
+    let mut positional: Vec<String> = Vec::new();
+    let mut vid = None;
+    let mut pid = None;
+    let mut serial = None;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--vid" => {
+                let value = args.next().ok_or("--vid requires a value")?;
+                vid = Some(parse_u16(&value)?);
+            }
+            "--pid" => {
+                let value = args.next().ok_or("--pid requires a value")?;
+                pid = Some(parse_u16(&value)?);
+            }
+            "--serial" => {
+                serial = Some(args.next().ok_or("--serial requires a value")?);
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown option '{other}'"));
+            }
+            _ => positional.push(arg),
+        }
+    }
 
     if positional.len() != 2 {
         return Err("expected <operation> <firmware_path>".to_string());
@@ -97,18 +137,73 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         operation: positional.remove(0),
         path: positional.remove(0),
+        vid,
+        pid,
+        serial,
     })
 }
 
-fn open_probe(lister: &Lister) -> Probe {
+/// Selects the debug probe to use. Filters the connected probes by
+/// `--vid`/`--pid`/`--serial` when given; exactly one probe must remain.
+/// Probes can take a moment to enumerate after plug-in, so an empty list is
+/// retried for up to 2 seconds before giving up.
+fn select_probe(lister: &Lister, args: &Args) -> Result<DebugProbeSelector, String> {
     let start = Utc::now().timestamp_millis();
 
-    let selector = DebugProbeSelector {
-        vendor_id: PROBE_VENDOR_ID,
-        product_id: PROBE_PRODUCT_ID,
-        interface: None,
-        serial_number: None,
+    let probes = loop {
+        let probes = lister.list_all();
+        if !probes.is_empty() || Utc::now().timestamp_millis() > start + 2000 {
+            break probes;
+        }
+        thread::sleep(Duration::from_millis(100));
     };
+
+    if probes.is_empty() {
+        return Err(
+            "No debug probe detected.\nPlease check that the programmer is connected via USB and powered on.".to_string(),
+        );
+    }
+
+    let matches: Vec<&DebugProbeInfo> = probes
+        .iter()
+        .filter(|p| args.vid.is_none_or(|v| p.vendor_id == v))
+        .filter(|p| args.pid.is_none_or(|v| p.product_id == v))
+        .filter(|p| {
+            args.serial
+                .as_deref()
+                .is_none_or(|s| p.serial_number.as_deref() == Some(s))
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            let mut msg =
+                String::from("No debug probe matched the supplied filter. Connected probes:\n");
+            for p in &probes {
+                msg.push_str(&format!("  - {}\n", p));
+            }
+            Err(msg)
+        }
+        [probe] => Ok(DebugProbeSelector {
+            vendor_id: probe.vendor_id,
+            product_id: probe.product_id,
+            interface: probe.interface,
+            serial_number: probe.serial_number.clone(),
+        }),
+        _ => {
+            let mut msg = String::from(
+                "Multiple debug probes connected. Specify --vid/--pid/--serial to disambiguate:\n",
+            );
+            for p in &matches {
+                msg.push_str(&format!("  - {}\n", p));
+            }
+            Err(msg)
+        }
+    }
+}
+
+fn open_probe(lister: &Lister, selector: &DebugProbeSelector) -> Probe {
+    let start = Utc::now().timestamp_millis();
 
     // Suppress panic output from probe-rs internals (e.g. Glasgow driver)
     let default_hook = std::panic::take_hook();
@@ -131,13 +226,17 @@ fn open_probe(lister: &Lister) -> Probe {
                     std::panic::set_hook(default_hook);
 
                     // Check if the probe is visible on USB but failed to open
-                    let probes = lister.list(Some(&selector));
+                    let probes = lister.list(Some(selector));
                     if probes.is_empty() {
                         eprintln!("\nError: No debug probe detected.");
-                        eprintln!("Please check that the programmer is connected via USB and powered on.");
+                        eprintln!(
+                            "Please check that the programmer is connected via USB and powered on."
+                        );
                     } else {
                         eprintln!("\nError: Debug probe found but unable to initialize.");
-                        eprintln!("Please check that the target board is connected to the programmer.");
+                        eprintln!(
+                            "Please check that the target board is connected to the programmer."
+                        );
                     }
                     std::process::exit(1);
                 }
@@ -170,8 +269,11 @@ fn detect_target_profile(mut probe: Probe) -> Result<TargetProfile, Error> {
     }
 }
 
-fn detect_target_profile_with_recovery(lister: &Lister) -> TargetProfile {
-    match detect_target_profile(open_probe(lister)) {
+fn detect_target_profile_with_recovery(
+    lister: &Lister,
+    selector: &DebugProbeSelector,
+) -> TargetProfile {
+    match detect_target_profile(open_probe(lister, selector)) {
         Ok(chip) => chip,
         Err(err) if should_try_recover(&err) => {
             log::warn!(
@@ -179,14 +281,14 @@ fn detect_target_profile_with_recovery(lister: &Lister) -> TargetProfile {
                 err
             );
 
-            restore_debug_access(open_probe(lister)).unwrap_or_else(|recover_err| {
+            restore_debug_access(open_probe(lister, selector)).unwrap_or_else(|recover_err| {
                 panic!(
                     "Unable to restore debug access before chip detection: {}",
                     recover_err
                 )
             });
 
-            detect_target_profile(open_probe(lister)).unwrap_or_else(|retry_err| {
+            detect_target_profile(open_probe(lister, selector)).unwrap_or_else(|retry_err| {
                 panic!(
                     "Unable to detect target chip after recovery! Error: {}",
                     retry_err
@@ -311,8 +413,8 @@ fn restore_debug_access(mut probe: Probe) -> Result<(), Error> {
     ))
 }
 
-fn attach_session(lister: &Lister, chip: TargetProfile) -> Session {
-    let probe = open_probe(lister);
+fn attach_session(lister: &Lister, selector: &DebugProbeSelector, chip: TargetProfile) -> Session {
+    let probe = open_probe(lister, selector);
 
     match probe.attach(
         chip.probe_rs_target_name(),
@@ -326,11 +428,11 @@ fn attach_session(lister: &Lister, chip: TargetProfile) -> Session {
                 err
             );
 
-            restore_debug_access(open_probe(lister)).unwrap_or_else(|recover_err| {
+            restore_debug_access(open_probe(lister, selector)).unwrap_or_else(|recover_err| {
                 panic!("Unable to restore debug access: {}", recover_err)
             });
 
-            let probe = open_probe(lister);
+            let probe = open_probe(lister, selector);
             probe
                 .attach(
                     chip.probe_rs_target_name(),
@@ -366,9 +468,13 @@ fn main() {
     }
 
     let lister = Lister::new();
-    let chip = detect_target_profile_with_recovery(&lister);
+    let selector = select_probe(&lister, &args).unwrap_or_else(|err| {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    });
+    let chip = detect_target_profile_with_recovery(&lister, &selector);
 
-    let mut session = attach_session(&lister, chip);
+    let mut session = attach_session(&lister, &selector, chip);
 
     // Get updater
     let mut updater = ModemUpdater::new_with_target(&mut session, chip);
