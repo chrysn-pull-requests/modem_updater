@@ -217,7 +217,15 @@ fn open_probe(lister: &Lister, selector: &DebugProbeSelector) -> Probe {
         match result {
             Ok(Ok(mut probe)) => {
                 std::panic::set_hook(default_hook);
-                probe.set_speed(12000).unwrap();
+                const DEFAULT_SPEED: u32 = 12000;
+                if probe.set_speed(DEFAULT_SPEED).is_err() {
+                    let found_speed = probe.speed_khz();
+                    if found_speed > 0 {
+                        eprintln!("Failed to set speed to default {DEFAULT_SPEED}kHz, continuing with the hardware's pre-set {found_speed}kHz.");
+                    } else {
+                        eprintln!("Failed to set speed to default {DEFAULT_SPEED}kHz, continuing with the hardware's pre-set but unreported speed.");
+                    }
+                }
                 return probe;
             }
             Ok(Err(_)) | Err(_) => {
